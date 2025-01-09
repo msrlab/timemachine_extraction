@@ -7,8 +7,6 @@ Description:
     unique user-edited files to a specified output directory. Files are considered
     "unique" if their SHA-256 hash is distinct.
 
-    The writing of this script was assisted by ChatGPT o1 model.
-
 Usage Example:
     # HFS+ example (old style)
     python3 extract_from_tm.py \
@@ -393,25 +391,23 @@ def count_snapshot_silently(snapshot_dir: Path) -> tuple[int, int]:
     if not snapshot_dir.is_dir():
         return (0, 0)
 
-    for volume_dir in snapshot_dir.iterdir():
-        if not volume_dir.is_dir():
+    # Revised to walk the snapshot_dir directly:
+    for root, dirs, files in os.walk(snapshot_dir):
+        root_path = Path(root)
+        if should_skip(root_path):
+            dirs[:] = []
             continue
-        for root, dirs, files in os.walk(volume_dir):
-            root_path = Path(root)
-            if should_skip(root_path):
-                dirs[:] = []
-                continue
 
-            for filename in files:
-                file_path = root_path / filename
-                if should_skip(file_path):
-                    continue
-                try:
-                    st_info = file_path.stat()
-                    file_count += 1
-                    total_size += st_info.st_size
-                except Exception:
-                    pass
+        for filename in files:
+            file_path = root_path / filename
+            if should_skip(file_path):
+                continue
+            try:
+                st_info = file_path.stat()
+                file_count += 1
+                total_size += st_info.st_size
+            except Exception:
+                pass
     return file_count, total_size
 
 
@@ -547,6 +543,7 @@ def process_snapshot(
 
     file_count, total_size = count_snapshot_silently(snapshot_dir)
     if file_count == 0 or total_size == 0:
+        logger.info(f"Snapshot '{snapshot_dir}' appears to have no files. Skipping.")
         return
 
     snapshot_name = snapshot_dir.name
@@ -576,139 +573,136 @@ def process_snapshot(
     dirty_hash_db = False
     dirty_metadata = False
 
-    for volume_dir in snapshot_dir.iterdir():
-        if not volume_dir.is_dir():
+    # Revised: directly walk the snapshot directory instead of iterating subdirs.
+    for root, dirs, files in os.walk(snapshot_dir):
+        root_path = Path(root)
+        if should_skip(root_path):
+            dirs[:] = []
             continue
 
-        for root, dirs, files in os.walk(volume_dir):
-            root_path = Path(root)
-            if should_skip(root_path):
-                dirs[:] = []
+        for filename in files:
+            file_path = root_path / filename
+            if should_skip(file_path):
                 continue
 
-            for filename in files:
-                file_path = root_path / filename
-                if should_skip(file_path):
-                    continue
+            try:
+                st_info = file_path.stat()
+            except Exception:
+                continue
 
-                try:
-                    st_info = file_path.stat()
-                except Exception:
-                    continue
+            file_size = st_info.st_size
+            file_mtime = st_info.st_mtime
+            processed_count += 1
+            processed_bytes += file_size
+            global_files_processed[0] += 1
 
-                file_size = st_info.st_size
-                file_mtime = st_info.st_mtime
-                processed_count += 1
-                processed_bytes += file_size
-                global_files_processed[0] += 1
+            file_hash, did_hash = process_file(
+                snapshot_dir=snapshot_dir,
+                file_path=file_path,
+                file_size=file_size,
+                file_mtime=file_mtime,
+                metadata_dict=metadata_dict,
+                hash_db_data=hash_db_data,
+                output_path=output_path,
+                resume_skiphashcheck=resume_skiphashcheck,
+                large_file_threshold=large_file_threshold,
+                inode_cache=inode_cache
+            )
+            if did_hash:
+                hashed_count += 1
+                hashed_bytes += file_size
 
-                file_hash, did_hash = process_file(
-                    snapshot_dir=snapshot_dir,
-                    file_path=file_path,
-                    file_size=file_size,
-                    file_mtime=file_mtime,
-                    metadata_dict=metadata_dict,
-                    hash_db_data=hash_db_data,
-                    output_path=output_path,
-                    resume_skiphashcheck=resume_skiphashcheck,
-                    large_file_threshold=large_file_threshold,
-                    inode_cache=inode_cache
-                )
-                if did_hash:
-                    hashed_count += 1
-                    hashed_bytes += file_size
-
-                if file_hash:
-                    if file_hash not in known_hashes:
+            if file_hash:
+                if file_hash not in known_hashes:
+                    try:
                         try:
-                            try:
-                                rel_path = file_path.relative_to(snapshot_dir.parent.parent)
-                            except ValueError:
-                                rel_path = file_path.relative_to(snapshot_dir)
+                            rel_path = file_path.relative_to(snapshot_dir.parent.parent)
+                        except ValueError:
+                            rel_path = file_path.relative_to(snapshot_dir)
 
-                            dest_file = output_path / rel_path
-                            dest_file.parent.mkdir(parents=True, exist_ok=True)
+                        dest_file = output_path / rel_path
+                        dest_file.parent.mkdir(parents=True, exist_ok=True)
 
-                            shutil.copy2(file_path, dest_file)
-                            copied_count += 1
-                            copied_bytes += file_size
+                        shutil.copy2(file_path, dest_file)
+                        copied_count += 1
+                        copied_bytes += file_size
 
-                            if verify_after_copy:
-                                new_hash = compute_hash(dest_file)
-                                if new_hash != file_hash:
-                                    logger.error(
-                                        f"Post-copy verification failed for {dest_file}. Removing partial file."
-                                    )
-                                    try:
-                                        dest_file.unlink()
-                                    except Exception as e:
-                                        logger.error(f"Could not remove corrupted file {dest_file}: {e}")
-                                    continue
+                        if verify_after_copy:
+                            new_hash = compute_hash(dest_file)
+                            if new_hash != file_hash:
+                                logger.error(
+                                    f"Post-copy verification failed for {dest_file}. Removing partial file."
+                                )
+                                try:
+                                    dest_file.unlink()
+                                except Exception as e:
+                                    logger.error(f"Could not remove corrupted file {dest_file}: {e}")
+                                continue
 
-                            hash_db_data["hashes"][file_hash] = {
-                                "dest": str(dest_file),
-                                "size": file_size,
-                                "source_snapshot": snapshot_name
-                            }
-                            known_hashes.add(file_hash)
-                            dirty_hash_db = True
+                        hash_db_data["hashes"][file_hash] = {
+                            "dest": str(dest_file),
+                            "size": file_size,
+                            "source_snapshot": snapshot_name
+                        }
+                        known_hashes.add(file_hash)
+                        dirty_hash_db = True
 
-                        except Exception as e:
-                            logger.error(f"Failed to copy {file_path} to {dest_file}: {e}")
+                    except Exception as e:
+                        logger.error(f"Failed to copy {file_path} to {dest_file}: {e}")
 
-                    old_meta = metadata_dict.get(str(file_path.resolve()), {})
-                    new_meta = {
-                        "mtime": file_mtime,
-                        "size": file_size,
-                        "hash": file_hash
-                    }
-                    if (
-                        old_meta.get("mtime") != file_mtime
-                        or old_meta.get("size") != file_size
-                        or old_meta.get("hash") != file_hash
-                    ):
-                        metadata_dict[str(file_path.resolve())] = new_meta
-                        dirty_metadata = True
+                old_meta = metadata_dict.get(str(file_path.resolve()), {})
+                new_meta = {
+                    "mtime": file_mtime,
+                    "size": file_size,
+                    "hash": file_hash
+                }
+                if (
+                    old_meta.get("mtime") != file_mtime
+                    or old_meta.get("size") != file_size
+                    or old_meta.get("hash") != file_hash
+                ):
+                    metadata_dict[str(file_path.resolve())] = new_meta
+                    dirty_metadata = True
 
-                if processed_count % console_interval == 0 or processed_count == file_count:
-                    fraction_done = processed_bytes / total_size if total_size else 1
-                    elapsed = time.time() - snapshot_start_time
-                    current_throughput = processed_bytes / elapsed if elapsed > 0 else 0
-                    time_left_snapshot = 0
-                    if current_throughput > 0 and fraction_done < 1:
-                        time_left_snapshot = (total_size - processed_bytes) / current_throughput
+            if processed_count % console_interval == 0 or processed_count == file_count:
+                fraction_done = processed_bytes / total_size if total_size else 1
+                elapsed = time.time() - snapshot_start_time
+                current_throughput = processed_bytes / elapsed if elapsed > 0 else 0
+                time_left_snapshot = 0
+                if current_throughput > 0 and fraction_done < 1:
+                    time_left_snapshot = (total_size - processed_bytes) / current_throughput
 
-                    full_run_str = ""
-                    if snapshot_index > 1:
-                        total_elapsed = time.time() - global_start_time
-                        total_bytes_so_far = global_bytes_processed[0] + processed_bytes
-                        global_throughput = (
-                            total_bytes_so_far / total_elapsed
-                            if total_elapsed > 0 else 0
-                        )
-                        snapshots_left = total_snapshots - snapshot_index
-                        bytes_left_current = max(0, (total_size - processed_bytes))
-                        future_bytes = (snapshots_left * total_size) + bytes_left_current
-                        time_left_full = (future_bytes / global_throughput) if global_throughput > 0 else 0
-                        full_run_str = f", full run: ~{time_left_full/60:.1f} min"
-
-                    console_line = (
-                        f"\rProcessed {processed_count}/{file_count} files "
-                        f"({human_readable_size(processed_bytes)} of {human_readable_size(total_size)}), "
-                        f"Hashed: {hashed_count} files ({human_readable_size(hashed_bytes)}), "
-                        f"Copied: {copied_count} files ({human_readable_size(copied_bytes)}). "
-                        f"Time left (snapshot): ~{time_left_snapshot/60:.1f} min{full_run_str}"
+                full_run_str = ""
+                if snapshot_index > 1:
+                    total_elapsed = time.time() - global_start_time
+                    total_bytes_so_far = global_bytes_processed[0] + processed_bytes
+                    global_throughput = (
+                        total_bytes_so_far / total_elapsed
+                        if total_elapsed > 0 else 0
                     )
-                    sys.stdout.write(console_line.ljust(160))
-                    sys.stdout.flush()
+                    snapshots_left = total_snapshots - snapshot_index
+                    bytes_left_current = max(0, (total_size - processed_bytes))
+                    future_bytes = (snapshots_left * total_size) + bytes_left_current
+                    time_left_full = (future_bytes / global_throughput) if global_throughput > 0 else 0
+                    full_run_str = f", full run: ~{time_left_full/60:.1f} min"
 
-                if processed_count % save_interval == 0:
-                    if dirty_hash_db:
-                        save_hash_db(hash_db_path, hash_db_data)
-                        dirty_hash_db = False
-                    if dirty_metadata:
-                        save_metadata_db(metadata_db_path, metadata_dict)
-                        dirty_metadata = False
+                console_line = (
+                    f"\rProcessed {processed_count}/{file_count} files "
+                    f"({human_readable_size(processed_bytes)} of {human_readable_size(total_size)}), "
+                    f"Hashed: {hashed_count} files ({human_readable_size(hashed_bytes)}), "
+                    f"Copied: {copied_count} files ({human_readable_size(copied_bytes)}). "
+                    f"Time left (snapshot): ~{time_left_snapshot/60:.1f} min{full_run_str}"
+                )
+                sys.stdout.write(console_line.ljust(160))
+                sys.stdout.flush()
+
+            if processed_count % save_interval == 0:
+                if dirty_hash_db:
+                    save_hash_db(hash_db_path, hash_db_data)
+                    dirty_hash_db = False
+                if dirty_metadata:
+                    save_metadata_db(metadata_db_path, metadata_dict)
+                    dirty_metadata = False
 
     sys.stdout.write("\n")
     sys.stdout.flush()
@@ -719,6 +713,11 @@ def process_snapshot(
         save_hash_db(hash_db_path, hash_db_data)
     if dirty_metadata:
         save_metadata_db(metadata_db_path, metadata_dict)
+
+    logger.info(
+        f"Finished processing snapshot '{relative_snapshot_str}' — "
+        f"copied {copied_count} new files ({human_readable_size(copied_bytes)})"
+    )
 
 
 def main():
